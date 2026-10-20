@@ -1,5 +1,0 @@
--mlongcalls
--fno-builtin-memcpy
--fno-builtin-memset
--fno-builtin-bzero
-"-specs=C:/Users/Brandon/Documents/ESP32 CWA50 controller/build/specs/picolibc.specs"
