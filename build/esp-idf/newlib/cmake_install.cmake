@@ -39,6 +39,6 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("C:/Users/Brandon/Downloads/ESP32-S3-Touch-LCD-1.69_Demo/ESP-IDF/02_ESP_IDF_ST7789_LVGL/build/esp-idf/newlib/src/port/cmake_install.cmake")
+  include("C:/Users/Brandon/Documents/ESP32 CWA50 controller/build/esp-idf/newlib/src/port/cmake_install.cmake")
 endif()
 

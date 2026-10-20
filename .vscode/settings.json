@@ -1,6 +1,6 @@
 {
     "idf.currentSetup": "C:\\esp\\v5.5.5\\esp-idf",
-    "idf.port": "COM6",
+    "idf.port": "COM8",
     "idf.openOcdConfigs": [
         "board/esp32s3-builtin.cfg"
     ],

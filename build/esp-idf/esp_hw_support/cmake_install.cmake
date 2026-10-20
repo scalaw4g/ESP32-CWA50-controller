@@ -39,16 +39,16 @@ endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("C:/Users/Brandon/Downloads/ESP32-S3-Touch-LCD-1.69_Demo/ESP-IDF/02_ESP_IDF_ST7789_LVGL/build/esp-idf/esp_hw_support/port/esp32s3/cmake_install.cmake")
+  include("C:/Users/Brandon/Documents/ESP32 CWA50 controller/build/esp-idf/esp_hw_support/port/esp32s3/cmake_install.cmake")
 endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("C:/Users/Brandon/Downloads/ESP32-S3-Touch-LCD-1.69_Demo/ESP-IDF/02_ESP_IDF_ST7789_LVGL/build/esp-idf/esp_hw_support/mspi_timing_tuning/port/esp32s3/cmake_install.cmake")
+  include("C:/Users/Brandon/Documents/ESP32 CWA50 controller/build/esp-idf/esp_hw_support/mspi_timing_tuning/port/esp32s3/cmake_install.cmake")
 endif()
 
 if(NOT CMAKE_INSTALL_LOCAL_ONLY)
   # Include the install script for the subdirectory.
-  include("C:/Users/Brandon/Downloads/ESP32-S3-Touch-LCD-1.69_Demo/ESP-IDF/02_ESP_IDF_ST7789_LVGL/build/esp-idf/esp_hw_support/lowpower/cmake_install.cmake")
+  include("C:/Users/Brandon/Documents/ESP32 CWA50 controller/build/esp-idf/esp_hw_support/lowpower/cmake_install.cmake")
 endif()
 

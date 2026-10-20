@@ -1,4 +1,4 @@
-# Install script for directory: C:/Users/Brandon/Downloads/ESP32-S3-Touch-LCD-1.69_Demo/ESP-IDF/02_ESP_IDF_ST7789_LVGL/managed_components/lvgl__lvgl
+# Install script for directory: C:/Users/Brandon/Documents/ESP32 CWA50 controller/managed_components/lvgl__lvgl
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)

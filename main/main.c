@@ -6,11 +6,12 @@
 
 /*
  * CWA50 pump controller for the Waveshare ESP32-S3-Touch-LCD-1.69.
- * The app uses LVGL for the 0-100 control slider and LEDC for pump PWM.
+ * The app uses LVGL preset buttons and LEDC for pump PWM.
  */
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_timer.h"
 #include "driver/i2c.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -52,12 +53,26 @@
 
 #define TOUCH_HOST I2C_NUM_0
 #define PUMP_PWM_GPIO GPIO_NUM_17
-#define PUMP_PWM_FREQUENCY_HZ 1000
+#define PUMP_PWM_FREQUENCY_HZ 150
+#define APP_SPLASH_DURATION_MS 2000
+#define APP_SPLASH_FADE_DURATION_MS 300
 
-/* The slider is a control scale: 0 is off; nonzero settings map to 13-85% PWM. */
+/* Presets use control positions mapped onto the configured pump PWM range. */
 #define PUMP_PWM_MIN_PERCENT 13
 #define PUMP_PWM_MAX_PERCENT 85
-#define PUMP_DEFAULT_SLIDER_POSITION 73
+#define PUMP_PRESET_OFF_POSITION 0
+#define PUMP_PRESET_LOW_POSITION 10
+#define PUMP_PRESET_MEDIUM_POSITION 55
+#define PUMP_PRESET_HIGH_POSITION 100
+#define PUMP_DEFAULT_PRESET_POSITION PUMP_PRESET_MEDIUM_POSITION
+
+typedef enum
+{
+    APP_PRESET_OFF = 0,
+    APP_PRESET_LOW,
+    APP_PRESET_MEDIUM,
+    APP_PRESET_HIGH,
+} app_preset_id_t;
 
 /* 8-bit LEDC counts rounded inward to stay within the pump's active-duty limits. */
 #define PUMP_PWM_MIN_DUTY 34
@@ -73,10 +88,38 @@ esp_lcd_touch_handle_t tp = NULL;
 #endif
 
 static const char *TAG = "EXAMPLE";
-static lv_obj_t *percent_label;
-static lv_obj_t *actual_pwm_label;
-static lv_obj_t *pwm_slider;
-static int startup_slider_position = PUMP_DEFAULT_SLIDER_POSITION;
+static lv_obj_t *pump_image;
+static lv_obj_t *pump_glow;
+static lv_obj_t *splash_logo;
+static lv_obj_t *preset_buttons[4];
+static lv_obj_t *preset_labels[4];
+static lv_coord_t pump_image_base_y;
+static app_preset_id_t startup_preset = APP_PRESET_MEDIUM;
+static int64_t splash_started_at_us;
+static int preset_positions[] = {
+    PUMP_PRESET_OFF_POSITION,
+    PUMP_PRESET_LOW_POSITION,
+    PUMP_PRESET_MEDIUM_POSITION,
+    PUMP_PRESET_HIGH_POSITION,
+};
+static app_preset_id_t preset_ids[] = {
+    APP_PRESET_OFF,
+    APP_PRESET_LOW,
+    APP_PRESET_MEDIUM,
+    APP_PRESET_HIGH,
+};
+static const char *preset_names[] = {"OFF", "LOW", "MED", "HIGH"};
+extern const lv_img_dsc_t pump_image_asset;
+extern const lv_img_dsc_t splash_image_asset;
+extern const lv_img_dsc_t glow_image_asset;
+
+#define PRESET_COUNT (sizeof(preset_positions) / sizeof(preset_positions[0]))
+#define NVS_KEY_PRESET_ID "preset_id"
+#define UI_COLOR_BACKGROUND 0x080A09
+#define UI_COLOR_TILE 0x151918
+#define UI_COLOR_TILE_SELECTED 0x18352D
+#define UI_COLOR_SEAFOAM 0x8FE3C1
+#define UI_COLOR_SEAFOAM_MUTED 0x4E7968
 
 /* LCD IO and panel */
 static esp_lcd_panel_io_handle_t lcd_io = NULL;
@@ -117,8 +160,8 @@ static void pump_set_duty(uint32_t duty)
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
 }
 
-/* Load the last released slider value; use the 65%-duty control default if absent. */
-static int app_load_slider_position(void)
+/* Load the selected preset ID; initialize new installations to MEDIUM. */
+static app_preset_id_t app_load_preset(void)
 {
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -132,42 +175,62 @@ static int app_load_slider_position(void)
     }
 
     nvs_handle_t nvs_handle;
-    err = nvs_open("pump", NVS_READONLY, &nvs_handle);
+    ESP_ERROR_CHECK(nvs_open("pump", NVS_READWRITE, &nvs_handle));
+
+    int32_t saved_preset_id = APP_PRESET_MEDIUM;
+    err = nvs_get_i32(nvs_handle, NVS_KEY_PRESET_ID, &saved_preset_id);
     if (err == ESP_ERR_NVS_NOT_FOUND)
     {
-        return PUMP_DEFAULT_SLIDER_POSITION;
+        err = nvs_set_i32(nvs_handle, NVS_KEY_PRESET_ID, APP_PRESET_MEDIUM);
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(nvs_handle);
+        }
+        nvs_close(nvs_handle);
+        ESP_ERROR_CHECK(err);
+        return APP_PRESET_MEDIUM;
     }
-    ESP_ERROR_CHECK(err);
+    if (err != ESP_OK)
+    {
+        nvs_close(nvs_handle);
+        ESP_ERROR_CHECK(err);
+    }
+    if (saved_preset_id < APP_PRESET_OFF || saved_preset_id > APP_PRESET_HIGH)
+    {
+        ESP_LOGW(TAG, "Saved preset ID is invalid; using MEDIUM");
+        saved_preset_id = APP_PRESET_MEDIUM;
+        err = nvs_set_i32(nvs_handle, NVS_KEY_PRESET_ID, saved_preset_id);
+        if (err == ESP_OK)
+        {
+            err = nvs_commit(nvs_handle);
+        }
+        nvs_close(nvs_handle);
+        ESP_ERROR_CHECK(err);
+        return APP_PRESET_MEDIUM;
+    }
 
-    int32_t saved_position = PUMP_DEFAULT_SLIDER_POSITION;
-    err = nvs_get_i32(nvs_handle, "slider", &saved_position);
     nvs_close(nvs_handle);
-    if (err == ESP_ERR_NVS_NOT_FOUND)
-    {
-        return PUMP_DEFAULT_SLIDER_POSITION;
-    }
-    ESP_ERROR_CHECK(err);
-
-    if (saved_position < 0 || saved_position > 100)
-    {
-        ESP_LOGW(TAG, "Saved slider position is invalid; using default");
-        return PUMP_DEFAULT_SLIDER_POSITION;
-    }
-    return saved_position;
+    return (app_preset_id_t)saved_preset_id;
 }
 
-static void app_save_slider_position(lv_event_t *event)
+static void app_save_preset_position(lv_event_t *event)
 {
-    const int32_t position = lv_slider_get_value(lv_event_get_target(event));
+    app_preset_id_t *preset = lv_event_get_user_data(event);
+    if (preset == NULL || *preset < APP_PRESET_OFF || *preset > APP_PRESET_HIGH)
+    {
+        ESP_LOGE(TAG, "Could not save preset: event has invalid preset ID");
+        return;
+    }
+
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open("pump", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Could not open NVS to save slider position: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Could not open NVS to save preset: %s", esp_err_to_name(err));
         return;
     }
 
-    err = nvs_set_i32(nvs_handle, "slider", position);
+    err = nvs_set_i32(nvs_handle, NVS_KEY_PRESET_ID, *preset);
     if (err == ESP_OK)
     {
         err = nvs_commit(nvs_handle);
@@ -175,27 +238,40 @@ static void app_save_slider_position(lv_event_t *event)
     nvs_close(nvs_handle);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Could not save slider position: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Could not save preset: %s", esp_err_to_name(err));
         return;
     }
-    ESP_LOGI(TAG, "Saved slider position %" PRId32, position);
+    ESP_LOGI(TAG, "Saved preset %s", preset_names[*preset]);
 }
 
-/* Convert the UI's 0-100 control scale into a safe pump PWM duty. */
-static void app_apply_slider_position(int slider_position)
+static void app_update_preset_button_styles(app_preset_id_t selected_preset)
 {
-    if (slider_position == 0)
+    for (size_t i = 0; i < PRESET_COUNT; i++)
+    {
+        const bool selected = i == (size_t)selected_preset;
+        lv_obj_set_style_bg_color(preset_buttons[i],
+                                  lv_color_hex(selected ? UI_COLOR_TILE_SELECTED : UI_COLOR_TILE),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_border_color(preset_buttons[i],
+                                      lv_color_hex(selected ? UI_COLOR_SEAFOAM : UI_COLOR_SEAFOAM_MUTED),
+                                      LV_PART_MAIN);
+        lv_obj_set_style_border_width(preset_buttons[i], selected ? 2 : 1, LV_PART_MAIN);
+        lv_obj_set_style_text_color(preset_labels[i], lv_color_hex(UI_COLOR_SEAFOAM), LV_PART_MAIN);
+    }
+}
+
+/* Convert a preset's control position into a safe pump PWM duty. */
+static void app_apply_preset_position(int preset_position)
+{
+    if (preset_position == PUMP_PRESET_OFF_POSITION)
     {
         pump_set_duty(0);
-        lv_label_set_text(percent_label, "OFF");
-        lv_label_set_text(actual_pwm_label, "PWM DUTY 0.00%");
-        printf("0 >>>>> 0.00\n");
         return;
     }
 
     /* Map control positions 1-100 linearly onto the datasheet's 13-85% range. */
     const int requested_percent = PUMP_PWM_MIN_PERCENT +
-        ((slider_position - 1) * (PUMP_PWM_MAX_PERCENT - PUMP_PWM_MIN_PERCENT) + 49) / 99;
+        ((preset_position - 1) * (PUMP_PWM_MAX_PERCENT - PUMP_PWM_MIN_PERCENT) + 49) / 99;
     int duty = (requested_percent * 255 + 50) / 100;
     if (duty < PUMP_PWM_MIN_DUTY)
     {
@@ -205,28 +281,162 @@ static void app_apply_slider_position(int slider_position)
     {
         duty = PUMP_PWM_MAX_DUTY;
     }
-    /* An 8-bit LEDC period has 256 steps, so report the applied duty accurately. */
-    const int percent_hundredths = (duty * 10000 + 128) / 256;
+    /* An 8-bit LEDC period has 256 steps. */
 
     pump_set_duty((uint32_t)duty);
-    lv_label_set_text_fmt(percent_label, "%d%%", slider_position);
-    lv_label_set_text_fmt(actual_pwm_label, "PWM DUTY %d.%02d%%", percent_hundredths / 100, percent_hundredths % 100);
-    printf("%d >>>>> %d.%02d\n", duty, percent_hundredths / 100, percent_hundredths % 100);
+}
+
+static void app_pump_animation_exec_cb(void *object, int32_t y)
+{
+    lv_obj_set_y((lv_obj_t *)object, y);
+}
+
+static void app_pump_shake_exec_cb(void *object, int32_t x)
+{
+    lv_obj_set_style_translate_x((lv_obj_t *)object, x, LV_PART_MAIN);
+}
+
+static void app_pump_rotate_exec_cb(void *object, int32_t angle)
+{
+    lv_img_set_angle((lv_obj_t *)object, angle);
+}
+
+static void app_pump_glow_exec_cb(void *object, int32_t opa)
+{
+    lv_obj_set_style_img_opa((lv_obj_t *)object, opa, LV_PART_MAIN);
+}
+
+static void app_start_pump_anim(void *object, lv_anim_exec_xcb_t exec_cb, int32_t from, int32_t to,
+                                uint32_t time_ms)
+{
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, object);
+    lv_anim_set_exec_cb(&animation, exec_cb);
+    lv_anim_set_values(&animation, from, to);
+    lv_anim_set_time(&animation, time_ms);
+    lv_anim_set_playback_time(&animation, time_ms);
+    lv_anim_set_repeat_count(&animation, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&animation, lv_anim_path_ease_in_out);
+    lv_anim_start(&animation);
+}
+
+static void app_update_pump_animation(app_preset_id_t preset)
+{
+    lv_anim_del(pump_image, app_pump_animation_exec_cb);
+    lv_anim_del(pump_image, app_pump_shake_exec_cb);
+    lv_anim_del(pump_image, app_pump_rotate_exec_cb);
+    lv_anim_del(pump_glow, app_pump_glow_exec_cb);
+    lv_obj_set_y(pump_image, pump_image_base_y);
+    lv_obj_set_style_translate_x(pump_image, 0, LV_PART_MAIN);
+    lv_img_set_angle(pump_image, 0);
+    lv_obj_set_style_img_opa(pump_glow, LV_OPA_TRANSP, LV_PART_MAIN);
+
+    /* Bob cycle, shake (px) and rotation (0.1 deg) amplitude, glow peak opacity. */
+    uint32_t cycle_ms;
+    int32_t shake = 0;
+    int32_t tilt = 0;
+    int32_t glow = 0;
+    switch (preset)
+    {
+    case APP_PRESET_OFF:
+        cycle_ms = 500;
+        break;
+    case APP_PRESET_LOW:
+        cycle_ms = 1400;
+        shake = 1;
+        tilt = 6;
+        glow = 70;
+        break;
+    case APP_PRESET_MEDIUM:
+        cycle_ms = 900;
+        shake = 2;
+        tilt = 10;
+        glow = 130;
+        break;
+    case APP_PRESET_HIGH:
+        cycle_ms = 500;
+        shake = 3;
+        tilt = 16;
+        glow = 200;
+        break;
+    default:
+        return;
+    }
+
+    app_start_pump_anim(pump_image, app_pump_animation_exec_cb, pump_image_base_y,
+                        pump_image_base_y - 3, cycle_ms);
+    if (shake > 0)
+    {
+        app_start_pump_anim(pump_image, app_pump_shake_exec_cb, -shake, shake, cycle_ms / 7 + 30);
+        app_start_pump_anim(pump_image, app_pump_rotate_exec_cb, -tilt, tilt, cycle_ms / 4 + 40);
+        app_start_pump_anim(pump_glow, app_pump_glow_exec_cb, glow / 3, glow, cycle_ms);
+    }
+}
+static void app_preset_button_event_cb(lv_event_t *event)
+{
+    app_preset_id_t *preset = lv_event_get_user_data(event);
+    if (preset == NULL || *preset < APP_PRESET_OFF || *preset > APP_PRESET_HIGH)
+    {
+        ESP_LOGE(TAG, "Preset button event has invalid preset ID");
+        return;
+    }
+
+    app_update_preset_button_styles(*preset);
+    app_apply_preset_position(preset_positions[*preset]);
+    app_update_pump_animation(*preset);
 }
 
 static void app_pump_wakeup(void)
 {
     /* Brief pump wake pulse, followed by an off interval before normal PWM control. */
-    pump_set_duty(PUMP_PWM_MAX_DUTY);
-    vTaskDelay(pdMS_TO_TICKS(300));
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "Pump wake cycle started");
+    ESP_LOGI(TAG, "Wake pulse 1: duty=255/256 for 30 ms");
+    pump_set_duty(255);
+    vTaskDelay(pdMS_TO_TICKS(30));
+    ESP_LOGI(TAG, "Wake interval 1: duty=0 for 100 ms");
     pump_set_duty(0);
     vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Wake pulse 2: duty=25/256 for 30 ms");
+    pump_set_duty(25);
+    vTaskDelay(pdMS_TO_TICKS(30));
+    ESP_LOGI(TAG, "Wake interval 2: duty=0 for 100 ms");
+    pump_set_duty(0);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGI(TAG, "Pump wake cycle complete");
 }
 
-static void app_pwm_slider_event_cb(lv_event_t *event)
+static void app_splash_opacity_exec_cb(void *object, int32_t opacity)
 {
-    lv_obj_t *slider = lv_event_get_target(event);
-    app_apply_slider_position(lv_slider_get_value(slider));
+    lv_obj_set_style_img_opa(object, (lv_opa_t)opacity, LV_PART_MAIN);
+}
+
+static void app_splash_fade_out(void)
+{
+    lvgl_port_lock(0);
+
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, splash_logo);
+    lv_anim_set_exec_cb(&animation, app_splash_opacity_exec_cb);
+    lv_anim_set_values(&animation, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&animation, APP_SPLASH_FADE_DURATION_MS);
+    lv_anim_set_path_cb(&animation, lv_anim_path_ease_in_out);
+    lv_anim_start(&animation);
+
+    lvgl_port_unlock();
+}
+
+static void app_wait_until_us(int64_t deadline_us)
+{
+    int64_t remaining_us = deadline_us - esp_timer_get_time();
+
+    while (remaining_us > 0)
+    {
+        vTaskDelay(pdMS_TO_TICKS((remaining_us + 999) / 1000));
+        remaining_us = deadline_us - esp_timer_get_time();
+    }
 }
 
 static esp_err_t app_lcd_init(void)
@@ -359,8 +569,8 @@ static esp_err_t app_lvgl_init(void)
         }};
     lvgl_disp = lvgl_port_add_disp(&disp_cfg);
     lvgl_port_lock(0);
-    /* LVGL also rotates pointer coordinates for this display rotation. */
-    lv_disp_set_rotation(lvgl_disp, LV_DISP_ROT_90);
+    /* 270 degrees keeps the landscape layout and turns it 180 degrees from 90. */
+    lv_disp_set_rotation(lvgl_disp, LV_DISP_ROT_270);
     lvgl_port_unlock();
 
     return ESP_OK;
@@ -371,40 +581,88 @@ static void app_main_display(void)
     lvgl_port_lock(0);
 
     lv_obj_t *screen = lv_scr_act();
-    lv_obj_set_style_bg_color(screen, lv_color_hex(0x101820), LV_PART_MAIN);
+    if (splash_logo != NULL)
+    {
+        lv_anim_del(splash_logo, app_splash_opacity_exec_cb);
+        splash_logo = NULL;
+    }
+    lv_obj_clean(screen);
+    lv_obj_set_style_bg_color(screen, lv_color_hex(UI_COLOR_BACKGROUND), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
 
-    lv_obj_t *title = lv_label_create(screen);
-    lv_label_set_text(title, "CWA50 PUMP CONTROL");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xE8F0F2), LV_PART_MAIN);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+    pump_glow = lv_img_create(screen);
+    lv_img_set_src(pump_glow, &glow_image_asset);
+    lv_obj_align(pump_glow, LV_ALIGN_TOP_MID, -5, 23);
+    lv_obj_set_style_img_recolor(pump_glow, lv_color_hex(UI_COLOR_SEAFOAM), LV_PART_MAIN);
+    lv_obj_set_style_img_recolor_opa(pump_glow, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_img_opa(pump_glow, LV_OPA_TRANSP, LV_PART_MAIN);
+    pump_image = lv_img_create(screen);
+    lv_img_set_pivot(pump_image, 72, 58);
+    lv_img_set_src(pump_image, &pump_image_asset);
+    /* Center the 116 px tall image in the 188 px of space above the buttons. */
+    lv_obj_align(pump_image, LV_ALIGN_TOP_MID, 0, 35);
+    pump_image_base_y = 35;
 
-    /* The main readout shows the 0-100 control value; the second shows applied PWM. */
-    percent_label = lv_label_create(screen);
-    lv_label_set_text(percent_label, "0%");
-    lv_obj_set_style_text_color(percent_label, lv_color_hex(0x36D6A0), LV_PART_MAIN);
-    lv_obj_set_style_text_font(percent_label, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(percent_label, LV_ALIGN_TOP_MID, 0, 82);
+    const lv_coord_t button_width = 65;
+    const lv_coord_t button_height = 44;
+    const lv_coord_t button_x[PRESET_COUNT] = {4, 73, 142, 211};
+    const lv_coord_t button_y = 188;
 
-    actual_pwm_label = lv_label_create(screen);
-    lv_label_set_text(actual_pwm_label, "PWM DUTY 0.00%");
-    lv_obj_set_style_text_color(actual_pwm_label, lv_color_hex(0x91A4AA), LV_PART_MAIN);
-    lv_obj_set_style_text_font(actual_pwm_label, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(actual_pwm_label, LV_ALIGN_TOP_MID, 0, 112);
+    for (size_t i = 0; i < PRESET_COUNT; i++)
+    {
+        preset_buttons[i] = lv_btn_create(screen);
+        lv_obj_set_size(preset_buttons[i], button_width, button_height);
+        lv_obj_set_pos(preset_buttons[i], button_x[i], button_y);
+        lv_obj_set_style_radius(preset_buttons[i], 10, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(preset_buttons[i], LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_border_opa(preset_buttons[i], LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(preset_buttons[i], lv_color_hex(UI_COLOR_TILE), LV_PART_MAIN);
+        lv_obj_set_style_border_color(preset_buttons[i], lv_color_hex(UI_COLOR_SEAFOAM_MUTED), LV_PART_MAIN);
+        lv_obj_set_style_border_width(preset_buttons[i], 1, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(preset_buttons[i], lv_color_hex(UI_COLOR_TILE_SELECTED), LV_STATE_PRESSED);
+        lv_obj_set_style_border_color(preset_buttons[i], lv_color_hex(UI_COLOR_SEAFOAM), LV_STATE_PRESSED);
+        lv_obj_set_style_shadow_width(preset_buttons[i], 0, LV_PART_MAIN);
 
-    pwm_slider = lv_slider_create(screen);
-    lv_slider_set_range(pwm_slider, 0, 100);
-    lv_slider_set_value(pwm_slider, startup_slider_position, LV_ANIM_OFF);
-    lv_obj_set_size(pwm_slider, 192, 24);
-    lv_obj_set_style_bg_color(pwm_slider, lv_color_hex(0x34434A), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(pwm_slider, lv_color_hex(0x36D6A0), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(pwm_slider, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
-    lv_obj_align(pwm_slider, LV_ALIGN_TOP_MID, 0, 158);
-    lv_obj_add_event_cb(pwm_slider, app_pwm_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    app_apply_slider_position(startup_slider_position);
-    /* Persist only when the user releases the slider, not during every drag update. */
-    lv_obj_add_event_cb(pwm_slider, app_save_slider_position, LV_EVENT_RELEASED, NULL);
+        preset_labels[i] = lv_label_create(preset_buttons[i]);
+        lv_label_set_text(preset_labels[i], preset_names[i]);
+        lv_obj_set_style_text_color(preset_labels[i], lv_color_hex(UI_COLOR_SEAFOAM), LV_PART_MAIN);
+        lv_obj_set_style_text_font(preset_labels[i], &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_center(preset_labels[i]);
+        lv_obj_add_event_cb(preset_buttons[i], app_preset_button_event_cb, LV_EVENT_CLICKED,
+                            &preset_ids[i]);
+        lv_obj_add_event_cb(preset_buttons[i], app_save_preset_position, LV_EVENT_CLICKED,
+                            &preset_ids[i]);
+    }
+
+    app_update_preset_button_styles(startup_preset);
+    app_apply_preset_position(preset_positions[startup_preset]);
+    app_update_pump_animation(startup_preset);
+
+    lvgl_port_unlock();
+}
+
+static void app_splash_display(void)
+{
+    lvgl_port_lock(0);
+
+    splash_started_at_us = esp_timer_get_time();
+    lv_obj_t *screen = lv_scr_act();
+    lv_obj_set_style_bg_color(screen, lv_color_hex(UI_COLOR_BACKGROUND), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
+
+    splash_logo = lv_img_create(screen);
+    lv_img_set_src(splash_logo, &splash_image_asset);
+    lv_obj_set_style_img_opa(splash_logo, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_align(splash_logo, LV_ALIGN_CENTER, 0, -14);
+
+    lv_anim_t animation;
+    lv_anim_init(&animation);
+    lv_anim_set_var(&animation, splash_logo);
+    lv_anim_set_exec_cb(&animation, app_splash_opacity_exec_cb);
+    lv_anim_set_values(&animation, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_time(&animation, APP_SPLASH_FADE_DURATION_MS);
+    lv_anim_set_path_cb(&animation, lv_anim_path_ease_in_out);
+    lv_anim_start(&animation);
 
     lvgl_port_unlock();
 }
@@ -412,15 +670,13 @@ static void app_main_display(void)
 void app_main(void)
 {
     /* Read settings before the wake pulse; the selected value is applied when UI is built. */
-    startup_slider_position = app_load_slider_position();
-    ESP_LOGI(TAG, "Loaded slider position %d", startup_slider_position);
+    startup_preset = app_load_preset();
+    ESP_LOGI(TAG, "Loaded preset %s", preset_names[startup_preset]);
 
     /* LCD HW initialization */
     ESP_ERROR_CHECK(app_lcd_init());
     ESP_ERROR_CHECK(app_control_init());
     pump_set_duty(0);
-    /* Run the pump wake pulse before LVGL starts; no LVGL lock is needed here. */
-    app_pump_wakeup();
 
 #if EXAMPLE_USE_TOUCH
     ESP_LOGI(TAG, "Initialize I2C bus");
@@ -466,16 +722,29 @@ void app_main(void)
     /* LVGL initialization */
     ESP_ERROR_CHECK(app_lvgl_init());
 
+    app_splash_display();
+    /* Keep the splash visible while the pump's startup wake sequence runs. */
+    app_pump_wakeup();
+
 #if EXAMPLE_USE_TOUCH
+    /* Register touch after the wake pulses so it doesn't read during pump noise. */
     static lv_indev_drv_t indev_drv; // Input device driver (Touch)
+    lvgl_port_lock(0);
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     indev_drv.disp = lvgl_disp;
     indev_drv.read_cb = example_lvgl_touch_cb;
     indev_drv.user_data = tp;
     lv_indev_drv_register(&indev_drv);
+    lvgl_port_unlock();
 #endif
 
-    /* Show LVGL objects */
+    app_wait_until_us(splash_started_at_us +
+                      (int64_t)(APP_SPLASH_DURATION_MS - APP_SPLASH_FADE_DURATION_MS) * 1000);
+    app_splash_fade_out();
+    app_wait_until_us(splash_started_at_us + (int64_t)APP_SPLASH_DURATION_MS * 1000);
+
+    ESP_LOGI(TAG, "Splash complete; showing main screen");
     app_main_display();
+    ESP_LOGI(TAG, "Main screen ready");
 }
