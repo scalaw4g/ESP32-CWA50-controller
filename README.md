@@ -4,10 +4,13 @@
 # CWA50 Pump Controller (ESP-IDF + LVGL)
 
 An ESP-IDF application for the Waveshare ESP32-S3-Touch-LCD-1.69 board that drives a
-CWA50-style pump over PWM, with touchscreen presets for manual control. This
+CWA50-style pump over PWM, with touchscreen presets for live speed control. This
 project started from Espressif's `02_ESP_IDF_ST7789_LVGL` display/touch example and
 was ported from an Arduino sketch (`esp32_cwa50.ino`) that used a potentiometer to
 set pump duty cycle.
+
+<img width="4032" height="3024" alt="IMG_2686" src="https://github.com/user-attachments/assets/9465e2f2-2727-404a-a745-140b4028017a" />
+<img width="4032" height="3024" alt="IMG_2687" src="https://github.com/user-attachments/assets/57fbbcdd-17cf-4a7a-8769-08a88e4e65f2" />
 
 ## Features
 
